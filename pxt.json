@@ -1,0 +1,16 @@
+{
+  "name": "rfm95w",
+  "version": "0.0.1",
+  "description": "Minimal library for the Adafruit RFM95W LoRa Radio Transceiver",
+  "dependencies": {
+    "core": "*"
+  },
+  "files": [
+    "rfm95w.ts",
+    "README.md"
+  ],
+  "public": true,
+  "supportedTargets": [
+    "microbit"
+  ]
+}
