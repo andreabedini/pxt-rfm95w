@@ -10,7 +10,6 @@ namespace Lora {
      * Frequency band to use.  Choose the band that matches the radio module
      * you purchased and the regulations in your country.
      */
-    //% block="Lora"
     export enum Band {
         //% block="EU (868 MHz)"
         EU868 = 868,
@@ -309,7 +308,7 @@ namespace Lora {
      * @param band frequency band matching your module and local regulations, eg: Lora.Band.EU868
      */
     //% block="LoRa init band %band"
-    //% group="Configuration"  weight=100
+    //% group="Configuration" weight=100
     export function init(band: Band) {
         spiInit()
         resetChip()
@@ -350,7 +349,7 @@ namespace Lora {
      */
     //% block="LoRa send string %value"
     //% value.shadowOptions.toString=true
-    //% group="Send"  weight=60
+    //% group="Send" weight=60
     export function sendString(value: string): void {
         if (!_inited) return
         const buf = control.createBufferFromUTF8(value)
@@ -363,7 +362,7 @@ namespace Lora {
      * 240 bytes at SF7/BW125.
      * @param buf the buffer to transmit
      */
-    //% group="Send"  weight=59  advanced=true
+    //% group="Send" weight=59  advanced=true
     export function sendBuffer(buf: Buffer): void {
         if (!_inited) return
 
@@ -387,9 +386,9 @@ namespace Lora {
      * Run code when a LoRa string is received.  The ``receivedString``
      * reporter contains the text that arrived.
      */
-    //% block="on LoRa received %receivedString"
+    //% block="on LoRa received $receivedString"
     //% draggableParameters="reporter"
-    //% group="Receive"  weight=50
+    //% group="Receive" weight=50
     export function onReceivedString(handler: (receivedString: string) => void): void {
         _rxHandler = handler
     }
@@ -400,7 +399,7 @@ namespace Lora {
      * showing a "sent" indicator without blocking.
      */
     //% block="on LoRa message sent"
-    //% group="Send"  advanced=true  weight=40
+    //% group="Send" advanced=true weight=40
     export function onSent(handler: () => void) {
         control.onEvent(LORA_EVENT_ID, APP_TX, handler)
     }
@@ -411,7 +410,7 @@ namespace Lora {
      * Returns 0 if no packet has been received yet.
      */
     //% block="LoRa signal strength (dBm)"
-    //% group="Receive"  weight=30
+    //% group="Receive" weight=30
     export function receivedSignalStrength(): number {
         return _lastRssi
     }
@@ -423,7 +422,7 @@ namespace Lora {
      * Returns 0 if no packet has been received yet.
      */
     //% block="LoRa received SNR (dB)"
-    //% group="Receive"  weight=29
+    //% group="Receive" weight=29
     export function receivedSnr(): number {
         const raw = _lastSnrRaw > 127 ? _lastSnrRaw - 256 : _lastSnrRaw
         return raw / 4
@@ -437,7 +436,7 @@ namespace Lora {
      * Returns 0 if the radio has not been initialised.
      */
     //% block="LoRa channel RSSI (dBm)"
-    //% group="Receive"  weight=28
+    //% group="Receive" weight=28
     export function channelRssi(): number {
         if (!_inited) return 0
         return readReg(REG_RSSI_VALUE) - 157
@@ -448,9 +447,9 @@ namespace Lora {
      * more current from the battery.  Both ends do not need to match.
      * @param dBm transmit power in dBm, between 2 and 20, eg: 17
      */
-    //% block="LoRa set TX power %dBm dBm"
+    //% block="LoRa set TX power $dBm dBm"
     //% dBm.min=2 dBm.max=20
-    //% group="Configuration"  advanced=true  weight=90
+    //% group="Configuration" advanced=true weight=90
     export function setTxPower(dBm: number): void {
         if (!_inited) return
         if (dBm == 20) {
@@ -470,8 +469,8 @@ namespace Lora {
      * communicate.  Default is SF7.
      * @param sf the spreading factor to use, eg: Lora.SpreadingFactor.SF7
      */
-    //% block="LoRa set spreading factor %sf"
-    //% group="Configuration"  advanced=true  weight=80
+    //% block="LoRa set spreading factor $sf"
+    //% group="Configuration" advanced=true weight=80
     export function setSpreadingFactor(sf: SpreadingFactor): void {
         if (!_inited) return
         _sf = sf
@@ -486,8 +485,8 @@ namespace Lora {
      * the sender and receiver must use the same bandwidth.  Default is 125 kHz.
      * @param bw the bandwidth to use, eg: Lora.Bandwidth.BW125k
      */
-    //% block="LoRa set bandwidth %bw"
-    //% group="Configuration"  advanced=true  weight=70
+    //% block="LoRa set bandwidth $bw"
+    //% group="Configuration" advanced=true weight=70
     export function setBandwidth(bw: Bandwidth): void {
         if (!_inited) return
         _bwCode = bw
@@ -503,8 +502,8 @@ namespace Lora {
      * Default is 4/5.
      * @param cr the coding rate to use, eg: Lora.CodingRate.CR45
      */
-    //% block="LoRa set coding rate %cr"
-    //% group="Configuration"  advanced=true  weight=60
+    //% block="LoRa set coding rate $cr"
+    //% group="Configuration" advanced=true weight=60
     export function setCodingRate(cr: CodingRate): void {
         if (!_inited) return
         const current = readReg(REG_MODEM_CONFIG_1)
@@ -517,9 +516,9 @@ namespace Lora {
      * networks.  ``0x34`` is the public LoRa default.  Both ends must match.
      * @param word sync word byte (0–255), eg: 0x34
      */
-    //% block="LoRa set sync word %word"
+    //% block="LoRa set sync word $word"
     //% word.min=0 word.max=255
-    //% group="Configuration"  advanced=true  weight=50
+    //% group="Configuration" advanced=true weight=50
     export function setSyncWord(word: number): void {
         if (!_inited) return
         writeReg(REG_SYNC_WORD, word)
