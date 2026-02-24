@@ -120,6 +120,12 @@ namespace Lora {
     const IRQ_PAYLOAD_CRC_ERROR = 0x20
     const IRQ_CLEAR_ALL = 0xFF
 
+    enum Dio0Mode {
+        RxDone = 0,
+        TxDone = 1,
+        CadDone = 2
+    }
+
     // BW lookup table: bandwidth in kHz × 100 (integer arithmetic, no floats)
     const BW_KHZ_X100 = [780, 1040, 1560, 2080, 3125, 4170, 6250, 12500, 25000, 50000]
 
@@ -127,6 +133,13 @@ namespace Lora {
     let _nss = DigitalPin.P16
     let _rst = DigitalPin.P8
     let _dio0 = DigitalPin.P1
+
+    // micro:bit default SPI pins are P13/P14/P15
+    let _mosi = DigitalPin.P15
+    let _miso = DigitalPin.P14
+    let _sck = DigitalPin.P13
+
+    let _dio0Armed = false
 
     let _inited = false
     let _rxHandler: (receivedString: string) => void = null
@@ -139,8 +152,7 @@ namespace Lora {
     function csDeselect() { pins.digitalWritePin(_nss, 1) }
 
     function spiInit() {
-        // micro:bit default SPI pins are P13/P14/P15
-        pins.spiPins(DigitalPin.P15, DigitalPin.P14, DigitalPin.P13)
+        pins.spiPins(_mosi, _miso, _sck)
         pins.spiFrequency(1000000) // start conservative; can go higher later
         pins.spiFormat(8, 0) // 8 bits, mode 0
         pins.digitalWritePin(_nss, 1)
@@ -248,57 +260,66 @@ namespace Lora {
     const INT_DIO0 = 0
     const APP_TX = 2
 
-    function setDio0Mapping(mapping: number) {
-        // mapping: 0b00 => RxDone, 0b01 => TxDone (LoRa mode)
+    function setDio0Mode(mapping: Dio0Mode) {
         let v = readReg(REG_DIO_MAPPING_1)
         v = (v & 0x3F) | ((mapping & 0x03) << 6)
         writeReg(REG_DIO_MAPPING_1, v)
     }
 
     function setupDio0Interrupt() {
-        pins.setPull(_dio0, PinPullMode.PullDown)
+        if (_dio0Armed) return
+        _dio0Armed = true
 
-        // DIO0 goes high on mapped events; treat it like a pulse/edge.
-        pins.onPulsed(_dio0, PulseValue.High, function () {
-            // Keep ISR work tiny
-            control.raiseEvent(LORA_EVENT_ID, INT_DIO0)
-        })
+        // Don't fight the radio; it drives push-pull.
+        pins.setPull(_dio0, PinPullMode.PullNone)
 
-        control.onEvent(LORA_EVENT_ID, INT_DIO0, function () {
-            const flags = readReg(REG_IRQ_FLAGS)
+        // Enable edge events for this pin (rise/fall).
+        pins.setEvents(_dio0, PinEventType.Edge)
 
-            // RxDone path
-            if ((flags & IRQ_RX_DONE) != 0) {
-                if ((flags & IRQ_PAYLOAD_CRC_ERROR) != 0) {
-                    writeReg(REG_IRQ_FLAGS, IRQ_CLEAR_ALL)
-                    return
+        // IMPORTANT: clear any pending IRQ BEFORE arming the handler,
+        // otherwise DIO0 may already be high and you won't get a "rise".
+        writeReg(REG_IRQ_FLAGS, IRQ_CLEAR_ALL)
+
+        control.onEvent(
+            EventBusSource.MICROBIT_ID_IO_P1,
+            EventBusValue.MICROBIT_PIN_EVT_RISE,
+            function () {
+                control.raiseEvent(LORA_EVENT_ID, INT_DIO0)
+                const flags = readReg(REG_IRQ_FLAGS)
+                if (flags == 0) return
+
+                // RxDone path
+                if ((flags & IRQ_RX_DONE) != 0) {
+                    if ((flags & IRQ_PAYLOAD_CRC_ERROR) != 0) {
+                        writeReg(REG_IRQ_FLAGS, flags)
+                        return
+                    }
+
+                    // Datasheet-correct FIFO read sequence
+                    const currentAddr = readReg(REG_FIFO_RX_CURRENT_ADDR)
+                    writeReg(REG_FIFO_ADDR_PTR, currentAddr)
+                    const len = readReg(REG_RX_NB_BYTES)
+                    const pkt = burstRead(REG_FIFO, len)
+
+                    _lastRssi = readReg(REG_PKT_RSSI_VALUE) - 157
+                    _lastSnrRaw = readReg(REG_PKT_SNR_VALUE)
+
+                    writeReg(REG_IRQ_FLAGS, flags)
+
+                    const msg = pkt.toString()
+                    if (_rxHandler != null) {
+                        control.runInBackground(function () { _rxHandler(msg) })
+                    }
                 }
 
-                // Datasheet-correct FIFO read sequence
-                const currentAddr = readReg(REG_FIFO_RX_CURRENT_ADDR)
-                writeReg(REG_FIFO_ADDR_PTR, currentAddr)
-                const len = readReg(REG_RX_NB_BYTES)
-                const pkt = burstRead(REG_FIFO, len)
-
-                _lastRssi = readReg(REG_PKT_RSSI_VALUE) - 157
-                _lastSnrRaw = readReg(REG_PKT_SNR_VALUE)
-
-                writeReg(REG_IRQ_FLAGS, IRQ_CLEAR_ALL)
-
-                const msg = pkt.toString()
-                if (_rxHandler != null) {
-                    control.runInBackground(function () { _rxHandler(msg) })
+                // TxDone path
+                if ((flags & IRQ_TX_DONE) != 0) {
+                    writeReg(REG_IRQ_FLAGS, flags)
+                    setDio0Mode(Dio0Mode.RxDone)
+                    setMode(MODE_RX_CONTINUOUS)
+                    control.raiseEvent(LORA_EVENT_ID, APP_TX)
                 }
-            }
-
-            // TxDone path
-            if ((flags & IRQ_TX_DONE) != 0) {
-                writeReg(REG_IRQ_FLAGS, IRQ_CLEAR_ALL)
-                setDio0Mapping(0)
-                setMode(MODE_RX_CONTINUOUS)
-                control.raiseEvent(LORA_EVENT_ID, APP_TX)
-            }
-        })
+            })
     }
 
     /**
@@ -327,15 +348,8 @@ namespace Lora {
 
         configRadioDefaults(band)
 
-        // Clear IRQs and go to RX continuous by default
-        writeReg(REG_IRQ_FLAGS, IRQ_CLEAR_ALL)
-        setMode(MODE_RX_CONTINUOUS)
-
         setupDio0Interrupt()
-
-        // Start in RX, so map DIO0 -> RxDone
-        setDio0Mapping(0) // 00
-        writeReg(REG_IRQ_FLAGS, IRQ_CLEAR_ALL)
+        setDio0Mode(Dio0Mode.RxDone)
         setMode(MODE_RX_CONTINUOUS)
 
         _inited = true
@@ -369,17 +383,13 @@ namespace Lora {
         setMode(MODE_STDBY)
         writeReg(REG_IRQ_FLAGS, IRQ_CLEAR_ALL)
 
-        // DIO0 -> TxDone while transmitting
-        setDio0Mapping(1) // 01
+        setDio0Mode(Dio0Mode.TxDone)
 
         writeReg(REG_FIFO_ADDR_PTR, 0x00)
         burstWrite(REG_FIFO, buf)
         writeReg(REG_PAYLOAD_LENGTH, buf.length)
 
         setMode(MODE_TX)
-
-        // No polling loop needed anymore if you use onSent().
-        // But: keep a fallback timeout if you want robustness.
     }
 
     /**
