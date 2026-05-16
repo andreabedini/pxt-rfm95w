@@ -1,9 +1,9 @@
 /**
  * LoRa radio driver for the HopeRF RFM95W / Semtech SX127x chipset.
- * Lets micro:bit programs send and receive text and raw bytes over long-range
- * LoRa radio without an internet connection.
+ * Lets micro:bit programs send and receive text, numbers and raw bytes over
+ * long-range LoRa radio without an internet connection.
  */
-//% color=#e67e22 icon="\uf1eb" weight=8
+//% color=#e67e22 icon="" weight=8
 namespace Lora {
 
     /**
@@ -79,6 +79,18 @@ namespace Lora {
         CR48 = 4
     }
 
+    /**
+     * Property of the last received packet.
+     */
+    export enum PacketProperty {
+        //% block="time"
+        Time = 0,
+        //% block="serial number"
+        SerialNumber = 1,
+        //% block="signal strength"
+        SignalStrength = 2
+    }
+
     // --- SX127x register map (subset) ---
     const REG_FIFO = 0x00
     const REG_OP_MODE = 0x01
@@ -119,6 +131,20 @@ namespace Lora {
     const IRQ_PAYLOAD_CRC_ERROR = 0x20
     const IRQ_CLEAR_ALL = 0xFF
 
+    // Packet wire format (compatible with micro:bit radio extension):
+    // | 0           | 1 ... 4     | 5 ... 8       | 9 ...
+    // | packet type | system time | serial number | payload
+    const PACKET_PREFIX_LENGTH = 9
+    const PACKET_TYPE_NUMBER = 0       // payload: Int32LE
+    const PACKET_TYPE_VALUE = 1        // payload: Int32LE, name length, name
+    const PACKET_TYPE_STRING = 2       // payload: string length, string
+    const PACKET_TYPE_BUFFER = 3       // payload: buffer length, buffer
+    const PACKET_TYPE_DOUBLE = 4       // payload: Float64LE
+    const PACKET_TYPE_DOUBLE_VALUE = 5 // payload: Float64LE, name length, name
+    const VALUE_PACKET_NAME_LEN_OFFSET = 13
+    const DOUBLE_VALUE_PACKET_NAME_LEN_OFFSET = 17
+    const MAX_NAME_LENGTH = 8
+
     // BW lookup table: bandwidth in kHz × 100 (integer arithmetic, no floats)
     const BW_KHZ_X100 = [780, 1040, 1560, 2080, 3125, 4170, 6250, 12500, 25000, 50000]
 
@@ -132,11 +158,17 @@ namespace Lora {
     let _sck = DigitalPin.P13
 
     let _inited = false
-    let _rxHandler: (receivedString: string) => void = null
+    let _transmitSerial = false
+    let _onReceivedNumberHandler: (receivedNumber: number) => void = null
+    let _onReceivedValueHandler: (name: string, value: number) => void = null
+    let _onReceivedStringHandler: (receivedString: string) => void = null
+    let _onReceivedBufferHandler: (receivedBuffer: Buffer) => void = null
     let _lastRssi = 0
-    let _lastSnrRaw = 0   // raw REG_PKT_SNR_VALUE (uint8 representing signed byte)
-    let _sf = 7           // current spreading factor (7–12)
-    let _bwCode = 7       // current BW register code (default 125 kHz)
+    let _lastSnrRaw = 0        // raw REG_PKT_SNR_VALUE (uint8 representing signed byte)
+    let _lastPacketTime = 0
+    let _lastPacketSerial = 0
+    let _sf = 7                // current spreading factor (7–12)
+    let _bwCode = 7            // current BW register code (default 125 kHz)
 
     function csSelect() { pins.digitalWritePin(_nss, 0) }
     function csDeselect() { pins.digitalWritePin(_nss, 1) }
@@ -215,30 +247,75 @@ namespace Lora {
         writeReg(REG_PREAMBLE_MSB, 0x00)
         writeReg(REG_PREAMBLE_LSB, 0x08) // 8 symbols
 
-        // Sync word: 0x34 is common for "public LoRa" style networks;
-        // for your own kid-network you can pick something else (0x12 etc.)
+        // Sync word: 0x34 is common for "public LoRa" style networks
         writeReg(REG_SYNC_WORD, 0x34)
 
         // Frequency
         if (band == Band.EU868) setFrequencyMHz(868.0)
         else setFrequencyMHz(915.0)
 
-        // Modem config:
-        // BW=125kHz, CR=4/5, Explicit header
+        // Modem config: BW=125kHz, CR=4/5, Explicit header
         // RegModemConfig1: BW bits 7..4, CR bits 3..1
         writeReg(REG_MODEM_CONFIG_1, 0x72) // 0b0111_0010
-        // RegModemConfig2: SF=7 (0x70), CRC on (bit2)
-        writeReg(REG_MODEM_CONFIG_2, 0x74) // SF7 + CRC on
+        // RegModemConfig2: SF=7 (0x70), CRC on (bit 2)
+        writeReg(REG_MODEM_CONFIG_2, 0x74)
         // RegModemConfig3: LowDataRateOptimize off, AGC auto on
         writeReg(REG_MODEM_CONFIG_3, 0x04)
 
         // LNA boost
         writeReg(REG_LNA, readReg(REG_LNA) | 0x03)
 
-        // PA config: PA_BOOST, modest power
-        // 0x80 selects PA_BOOST. Lower 4 bits are output power.
+        // PA_BOOST path; lower 4 bits are output power
         writeReg(REG_PA_CONFIG, 0x80 | 0x0F)
-        writeReg(REG_PA_DAC, 0x84)   // default; 0x87 enables 20 dBm
+        writeReg(REG_PA_DAC, 0x84) // 0x87 enables 20 dBm
+    }
+
+    function transmit(buf: Buffer): void {
+        setMode(MODE_STDBY)
+        writeReg(REG_IRQ_FLAGS, IRQ_CLEAR_ALL)
+        writeReg(REG_FIFO_ADDR_PTR, 0x00)
+        burstWrite(REG_FIFO, buf)
+        writeReg(REG_PAYLOAD_LENGTH, buf.length)
+        setMode(MODE_TX)
+        pauseUntil(() => (readReg(REG_IRQ_FLAGS) & IRQ_TX_DONE) != 0)
+        writeReg(REG_IRQ_FLAGS, IRQ_TX_DONE)
+        setMode(MODE_RX_CONTINUOUS)
+    }
+
+    function handlePacket(raw: Buffer): void {
+        if (raw.length < PACKET_PREFIX_LENGTH) return
+        _lastPacketTime = raw.getNumber(NumberFormat.Int32LE, 1)
+        _lastPacketSerial = raw.getNumber(NumberFormat.Int32LE, 5)
+        const t = raw[0]
+        if (t == PACKET_TYPE_NUMBER && raw.length >= PACKET_PREFIX_LENGTH + 4) {
+            if (_onReceivedNumberHandler)
+                _onReceivedNumberHandler(raw.getNumber(NumberFormat.Int32LE, PACKET_PREFIX_LENGTH))
+        } else if (t == PACKET_TYPE_DOUBLE && raw.length >= PACKET_PREFIX_LENGTH + 8) {
+            if (_onReceivedNumberHandler)
+                _onReceivedNumberHandler(raw.getNumber(NumberFormat.Float64LE, PACKET_PREFIX_LENGTH))
+        } else if (t == PACKET_TYPE_STRING && raw.length > PACKET_PREFIX_LENGTH) {
+            if (_onReceivedStringHandler) {
+                const len = raw[PACKET_PREFIX_LENGTH]
+                _onReceivedStringHandler(raw.slice(PACKET_PREFIX_LENGTH + 1, len).toString())
+            }
+        } else if (t == PACKET_TYPE_BUFFER && raw.length > PACKET_PREFIX_LENGTH) {
+            if (_onReceivedBufferHandler) {
+                const len = raw[PACKET_PREFIX_LENGTH]
+                _onReceivedBufferHandler(raw.slice(PACKET_PREFIX_LENGTH + 1, len))
+            }
+        } else if (t == PACKET_TYPE_VALUE && raw.length > VALUE_PACKET_NAME_LEN_OFFSET) {
+            if (_onReceivedValueHandler) {
+                const num = raw.getNumber(NumberFormat.Int32LE, PACKET_PREFIX_LENGTH)
+                const nameLen = raw[VALUE_PACKET_NAME_LEN_OFFSET]
+                _onReceivedValueHandler(raw.slice(VALUE_PACKET_NAME_LEN_OFFSET + 1, nameLen).toString(), num)
+            }
+        } else if (t == PACKET_TYPE_DOUBLE_VALUE && raw.length > DOUBLE_VALUE_PACKET_NAME_LEN_OFFSET) {
+            if (_onReceivedValueHandler) {
+                const num = raw.getNumber(NumberFormat.Float64LE, PACKET_PREFIX_LENGTH)
+                const nameLen = raw[DOUBLE_VALUE_PACKET_NAME_LEN_OFFSET]
+                _onReceivedValueHandler(raw.slice(DOUBLE_VALUE_PACKET_NAME_LEN_OFFSET + 1, nameLen).toString(), num)
+            }
+        }
     }
 
     /**
@@ -278,10 +355,7 @@ namespace Lora {
                     const pkt = burstRead(REG_FIFO, len)
                     _lastRssi = readReg(REG_PKT_RSSI_VALUE) - 157
                     _lastSnrRaw = readReg(REG_PKT_SNR_VALUE)
-                    const msg = pkt.toString()
-                    if (_rxHandler != null) {
-                        control.runInBackground(function () { _rxHandler(msg) })
-                    }
+                    control.runInBackground(function () { handlePacket(pkt) })
                 }
                 writeReg(REG_IRQ_FLAGS, IRQ_CLEAR_ALL)
             }
@@ -292,9 +366,49 @@ namespace Lora {
     }
 
     /**
-     * Send a text string over LoRa.  The string is encoded as UTF-8 and
-     * transmitted immediately.  The radio returns to receive mode automatically
-     * once transmission is complete.
+     * Send a number over LoRa.  Integers are sent as 32-bit; non-integers as
+     * 64-bit double — matching the micro:bit radio packet format.
+     * @param value the number to send, eg: 0
+     */
+    //% block="LoRa send number %value"
+    //% group="Send" weight=62
+    export function sendNumber(value: number): void {
+        if (!_inited) return
+        const isInt = value === (value | 0)
+        const buf = pins.createBuffer(PACKET_PREFIX_LENGTH + (isInt ? 4 : 8))
+        buf[0] = isInt ? PACKET_TYPE_NUMBER : PACKET_TYPE_DOUBLE
+        buf.setNumber(NumberFormat.Int32LE, 1, control.millis())
+        buf.setNumber(NumberFormat.Int32LE, 5, _transmitSerial ? control.deviceSerialNumber() : 0)
+        buf.setNumber(isInt ? NumberFormat.Int32LE : NumberFormat.Float64LE, PACKET_PREFIX_LENGTH, value)
+        transmit(buf)
+    }
+
+    /**
+     * Send a name/value pair over LoRa.  The name can be at most 8 characters.
+     * @param name the field name, eg: "temp"
+     * @param value the numeric value, eg: 0
+     */
+    //% block="LoRa send value %name = %value"
+    //% group="Send" weight=61
+    export function sendValue(name: string, value: number): void {
+        if (!_inited) return
+        const isInt = value === (value | 0)
+        const nameEncoded = control.createBufferFromUTF8(name)
+        const nameLen = Math.min(nameEncoded.length, MAX_NAME_LENGTH)
+        const numSize = isInt ? 4 : 8
+        const buf = pins.createBuffer(PACKET_PREFIX_LENGTH + numSize + 1 + nameLen)
+        buf[0] = isInt ? PACKET_TYPE_VALUE : PACKET_TYPE_DOUBLE_VALUE
+        buf.setNumber(NumberFormat.Int32LE, 1, control.millis())
+        buf.setNumber(NumberFormat.Int32LE, 5, _transmitSerial ? control.deviceSerialNumber() : 0)
+        buf.setNumber(isInt ? NumberFormat.Int32LE : NumberFormat.Float64LE, PACKET_PREFIX_LENGTH, value)
+        buf[PACKET_PREFIX_LENGTH + numSize] = nameLen
+        buf.write(PACKET_PREFIX_LENGTH + numSize + 1, nameEncoded.slice(0, nameLen))
+        transmit(buf)
+    }
+
+    /**
+     * Send a text string over LoRa.  The radio returns to receive mode
+     * automatically once transmission is complete.
      * @param value the string to send, eg: "Hello!"
      */
     //% block="LoRa send string %value"
@@ -302,31 +416,53 @@ namespace Lora {
     //% group="Send" weight=60
     export function sendString(value: string): void {
         if (!_inited) return
-        const buf = control.createBufferFromUTF8(value)
-        sendBuffer(buf)
+        const encoded = control.createBufferFromUTF8(value)
+        const len = encoded.length
+        const buf = pins.createBuffer(PACKET_PREFIX_LENGTH + 1 + len)
+        buf[0] = PACKET_TYPE_STRING
+        buf.setNumber(NumberFormat.Int32LE, 1, control.millis())
+        buf.setNumber(NumberFormat.Int32LE, 5, _transmitSerial ? control.deviceSerialNumber() : 0)
+        buf[PACKET_PREFIX_LENGTH] = len
+        buf.write(PACKET_PREFIX_LENGTH + 1, encoded)
+        transmit(buf)
     }
 
     /**
      * Send a raw buffer of bytes over LoRa.  Use this when you need to send
-     * binary data or a custom packet format.  Maximum recommended payload is
-     * 240 bytes at SF7/BW125.
-     * @param buf the buffer to transmit
+     * binary data or a custom packet format.
+     * @param payload the buffer to transmit
      */
-    //% group="Send" weight=59  advanced=true
-    export function sendBuffer(buf: Buffer): void {
+    //% group="Send" weight=59 advanced=true
+    export function sendBuffer(payload: Buffer): void {
         if (!_inited) return
+        const len = payload.length
+        const buf = pins.createBuffer(PACKET_PREFIX_LENGTH + 1 + len)
+        buf[0] = PACKET_TYPE_BUFFER
+        buf.setNumber(NumberFormat.Int32LE, 1, control.millis())
+        buf.setNumber(NumberFormat.Int32LE, 5, _transmitSerial ? control.deviceSerialNumber() : 0)
+        buf[PACKET_PREFIX_LENGTH] = len
+        buf.write(PACKET_PREFIX_LENGTH + 1, payload)
+        transmit(buf)
+    }
 
-        setMode(MODE_STDBY)
-        writeReg(REG_IRQ_FLAGS, IRQ_CLEAR_ALL)
+    /**
+     * Run code when a LoRa number is received.
+     */
+    //% block="on LoRa received $receivedNumber"
+    //% draggableParameters="reporter"
+    //% group="Receive" weight=52
+    export function onReceivedNumber(handler: (receivedNumber: number) => void): void {
+        _onReceivedNumberHandler = handler
+    }
 
-        writeReg(REG_FIFO_ADDR_PTR, 0x00)
-        burstWrite(REG_FIFO, buf)
-        writeReg(REG_PAYLOAD_LENGTH, buf.length)
-
-        setMode(MODE_TX)
-        pauseUntil(() => (readReg(REG_IRQ_FLAGS) & IRQ_TX_DONE) != 0)
-        writeReg(REG_IRQ_FLAGS, IRQ_TX_DONE)
-        setMode(MODE_RX_CONTINUOUS)
+    /**
+     * Run code when a LoRa name/value pair is received.
+     */
+    //% block="on LoRa received $name = $value"
+    //% draggableParameters="reporter"
+    //% group="Receive" weight=51
+    export function onReceivedValue(handler: (name: string, value: number) => void): void {
+        _onReceivedValueHandler = handler
     }
 
     /**
@@ -337,7 +473,30 @@ namespace Lora {
     //% draggableParameters="reporter"
     //% group="Receive" weight=50
     export function onReceivedString(handler: (receivedString: string) => void): void {
-        _rxHandler = handler
+        _onReceivedStringHandler = handler
+    }
+
+    /**
+     * Run code when a LoRa buffer is received.
+     */
+    //% group="Receive" advanced=true weight=49
+    export function onReceivedBuffer(handler: (receivedBuffer: Buffer) => void): void {
+        _onReceivedBufferHandler = handler
+    }
+
+    /**
+     * Returns a property of the last received packet.
+     * @param type the property to retrieve
+     */
+    //% block="LoRa received packet %type"
+    //% group="Receive" weight=35
+    export function receivedPacket(type: PacketProperty): number {
+        switch (type) {
+            case PacketProperty.Time: return _lastPacketTime
+            case PacketProperty.SerialNumber: return _lastPacketSerial
+            case PacketProperty.SignalStrength: return _lastRssi
+            default: return 0
+        }
     }
 
     /**
@@ -376,6 +535,16 @@ namespace Lora {
     export function channelRssi(): number {
         if (!_inited) return 0
         return readReg(REG_RSSI_VALUE) - 157
+    }
+
+    /**
+     * Set whether to include the device serial number in each sent packet.
+     * @param transmit true to include the serial number, eg: true
+     */
+    //% block="LoRa transmit serial number %transmit"
+    //% group="Configuration" advanced=true weight=45
+    export function setTransmitSerialNumber(transmit: boolean): void {
+        _transmitSerial = transmit
     }
 
     /**
