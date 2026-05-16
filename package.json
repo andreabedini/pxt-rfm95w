@@ -1,0 +1,9 @@
+{
+  "name": "rfm95w",
+  "private": true,
+  "devDependencies": {
+    "makecode": "^1.3.5",
+    "pxt": "^0.5.1",
+    "typescript": "^5.8.0"
+  }
+}

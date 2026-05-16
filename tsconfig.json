@@ -2,6 +2,7 @@
     "compilerOptions": {
         "target": "ES5",
         "noImplicitAny": true,
+        "skipLibCheck": true,
         "outDir": "built",
         "rootDir": "."
     },
@@ -10,6 +11,7 @@
     ],
     "exclude": [
         "built/**",
+        "node_modules/**",
         "pxt_modules/**/*test.ts"
     ]
 }
