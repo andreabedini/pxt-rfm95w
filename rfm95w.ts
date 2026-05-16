@@ -122,7 +122,6 @@ namespace Lora {
 
     enum Dio0Mode {
         RxDone = 0,
-        TxDone = 1,
         CadDone = 2
     }
 
@@ -255,10 +254,8 @@ namespace Lora {
         writeReg(REG_DIO_MAPPING_1, 0x00)
     }
 
-    // Event IDs for internal use. App code can use onReceivedString/onSent which are mapped to these.
     const LORA_EVENT_ID = 3110
     const INT_DIO0 = 0
-    const APP_TX = 2
 
     function setDio0Mode(mapping: Dio0Mode) {
         let v = readReg(REG_DIO_MAPPING_1)
@@ -312,13 +309,6 @@ namespace Lora {
                     }
                 }
 
-                // TxDone path
-                if ((flags & IRQ_TX_DONE) != 0) {
-                    writeReg(REG_IRQ_FLAGS, flags)
-                    setDio0Mode(Dio0Mode.RxDone)
-                    setMode(MODE_RX_CONTINUOUS)
-                    control.raiseEvent(LORA_EVENT_ID, APP_TX)
-                }
             })
     }
 
@@ -383,13 +373,14 @@ namespace Lora {
         setMode(MODE_STDBY)
         writeReg(REG_IRQ_FLAGS, IRQ_CLEAR_ALL)
 
-        setDio0Mode(Dio0Mode.TxDone)
-
         writeReg(REG_FIFO_ADDR_PTR, 0x00)
         burstWrite(REG_FIFO, buf)
         writeReg(REG_PAYLOAD_LENGTH, buf.length)
 
         setMode(MODE_TX)
+        pauseUntil(() => (readReg(REG_IRQ_FLAGS) & IRQ_TX_DONE) != 0)
+        writeReg(REG_IRQ_FLAGS, IRQ_TX_DONE)
+        setMode(MODE_RX_CONTINUOUS)
     }
 
     /**
@@ -401,17 +392,6 @@ namespace Lora {
     //% group="Receive" weight=50
     export function onReceivedString(handler: (receivedString: string) => void): void {
         _rxHandler = handler
-    }
-
-    /**
-     * Run code when a transmission finishes and the radio has returned to
-     * receive mode.  Useful for sequencing back-to-back transmissions or
-     * showing a "sent" indicator without blocking.
-     */
-    //% block="on LoRa message sent"
-    //% group="Send" advanced=true weight=40
-    export function onSent(handler: () => void) {
-        control.onEvent(LORA_EVENT_ID, APP_TX, handler)
     }
 
     /**
