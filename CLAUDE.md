@@ -47,14 +47,14 @@ CI runs `npx makecode` on every push via `.github/workflows/makecode.yml`. There
 
 ## Architecture
 
-The driver is interrupt-driven. `init()` wires a rising-edge interrupt on DIO0 (P1) using `pins.setEvents` + `control.onEvent`. The interrupt handler reads `REG_IRQ_FLAGS` to distinguish RxDone from TxDone, then fires a user callback or raises an internal event.
+The driver is polling-based — no interrupt pin is required. Both TX and RX are driven by `pauseUntil()` loops against `REG_IRQ_FLAGS`.
 
 Key design points:
 - **SPI**: 1 MHz, 8-bit mode 0. NSS is bit-banged (P16). Registers are read/written via `readReg`/`writeReg`; bulk transfers via `burstRead`/`burstWrite`.
-- **State machine**: radio stays in `MODE_RX_CONTINUOUS` except during transmit. After TxDone fires, the ISR switches DIO0 mapping back to RxDone and re-enters RX.
+- **State machine**: radio stays in `MODE_RX_CONTINUOUS` except during transmit. After TX completes, `sendBuffer` polls for `IRQ_TX_DONE`, clears the flag, and re-enters RX before returning.
+- **RX fiber**: `init()` spawns a `control.runInBackground` loop that uses `pauseUntil(() => IRQ_RX_DONE)`, reads the FIFO, and dispatches the user callback via a second background fiber.
 - **LDRO**: `applyLdro()` is called after any SF or BW change; it enables Low Data Rate Optimize when symbol duration exceeds 16 ms (required by the SX127x datasheet).
 - **TX power**: PA_BOOST pin path is used throughout. 20 dBm requires writing `0x87` to `REG_PA_DAC`; all other levels use `0x84`.
-- **Events**: `LORA_EVENT_ID = 3110` is a private event bus ID. `INT_DIO0 = 0` and `APP_TX = 2` are its values.
 
 ## Adafruit RFM95W / Semtech SX1276 documentation
 

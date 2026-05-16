@@ -17,7 +17,6 @@ Connect the RFM95W breakout to the micro:bit edge connector as follows:
 | MISO       | P15           |
 | CS / NSS   | P16           |
 | RST        | P8            |
-| G0 / DIO0  | P1            |
 | VIN        | 3V            |
 | GND        | GND           |
 
