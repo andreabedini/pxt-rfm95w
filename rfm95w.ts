@@ -103,7 +103,6 @@ namespace Lora {
     const REG_PAYLOAD_LENGTH = 0x22
     const REG_MODEM_CONFIG_3 = 0x26
     const REG_SYNC_WORD = 0x39
-    const REG_DIO_MAPPING_1 = 0x40
     const REG_VERSION = 0x42
     const REG_PA_DAC = 0x4D
 
@@ -120,25 +119,17 @@ namespace Lora {
     const IRQ_PAYLOAD_CRC_ERROR = 0x20
     const IRQ_CLEAR_ALL = 0xFF
 
-    enum Dio0Mode {
-        RxDone = 0,
-        CadDone = 2
-    }
-
     // BW lookup table: bandwidth in kHz × 100 (integer arithmetic, no floats)
     const BW_KHZ_X100 = [780, 1040, 1560, 2080, 3125, 4170, 6250, 12500, 25000, 50000]
 
     // Wiring defaults (override if you want later)
     let _nss = DigitalPin.P16
     let _rst = DigitalPin.P8
-    let _dio0 = DigitalPin.P1
 
     // micro:bit default SPI pins are P13/P14/P15
     let _mosi = DigitalPin.P15
     let _miso = DigitalPin.P14
     let _sck = DigitalPin.P13
-
-    let _dio0Armed = false
 
     let _inited = false
     let _rxHandler: (receivedString: string) => void = null
@@ -248,68 +239,6 @@ namespace Lora {
         // 0x80 selects PA_BOOST. Lower 4 bits are output power.
         writeReg(REG_PA_CONFIG, 0x80 | 0x0F)
         writeReg(REG_PA_DAC, 0x84)   // default; 0x87 enables 20 dBm
-
-        // Map DIO0: in LoRa mode, DIO0 can be RxDone (00) or TxDone (01) depending on mode.
-        // We'll just leave mapping at default 0 and read IRQ flags by polling.
-        writeReg(REG_DIO_MAPPING_1, 0x00)
-    }
-
-    const LORA_EVENT_ID = 3110
-    const INT_DIO0 = 0
-
-    function setDio0Mode(mapping: Dio0Mode) {
-        let v = readReg(REG_DIO_MAPPING_1)
-        v = (v & 0x3F) | ((mapping & 0x03) << 6)
-        writeReg(REG_DIO_MAPPING_1, v)
-    }
-
-    function setupDio0Interrupt() {
-        if (_dio0Armed) return
-        _dio0Armed = true
-
-        // Don't fight the radio; it drives push-pull.
-        pins.setPull(_dio0, PinPullMode.PullNone)
-
-        // Enable edge events for this pin (rise/fall).
-        pins.setEvents(_dio0, PinEventType.Edge)
-
-        // IMPORTANT: clear any pending IRQ BEFORE arming the handler,
-        // otherwise DIO0 may already be high and you won't get a "rise".
-        writeReg(REG_IRQ_FLAGS, IRQ_CLEAR_ALL)
-
-        control.onEvent(
-            EventBusSource.MICROBIT_ID_IO_P1,
-            EventBusValue.MICROBIT_PIN_EVT_RISE,
-            function () {
-                control.raiseEvent(LORA_EVENT_ID, INT_DIO0)
-                const flags = readReg(REG_IRQ_FLAGS)
-                if (flags == 0) return
-
-                // RxDone path
-                if ((flags & IRQ_RX_DONE) != 0) {
-                    if ((flags & IRQ_PAYLOAD_CRC_ERROR) != 0) {
-                        writeReg(REG_IRQ_FLAGS, flags)
-                        return
-                    }
-
-                    // Datasheet-correct FIFO read sequence
-                    const currentAddr = readReg(REG_FIFO_RX_CURRENT_ADDR)
-                    writeReg(REG_FIFO_ADDR_PTR, currentAddr)
-                    const len = readReg(REG_RX_NB_BYTES)
-                    const pkt = burstRead(REG_FIFO, len)
-
-                    _lastRssi = readReg(REG_PKT_RSSI_VALUE) - 157
-                    _lastSnrRaw = readReg(REG_PKT_SNR_VALUE)
-
-                    writeReg(REG_IRQ_FLAGS, flags)
-
-                    const msg = pkt.toString()
-                    if (_rxHandler != null) {
-                        control.runInBackground(function () { _rxHandler(msg) })
-                    }
-                }
-
-            })
     }
 
     /**
@@ -338,8 +267,25 @@ namespace Lora {
 
         configRadioDefaults(band)
 
-        setupDio0Interrupt()
-        setDio0Mode(Dio0Mode.RxDone)
+        control.runInBackground(function () {
+            while (true) {
+                pauseUntil(() => (readReg(REG_IRQ_FLAGS) & IRQ_RX_DONE) != 0)
+                const flags = readReg(REG_IRQ_FLAGS)
+                if ((flags & IRQ_PAYLOAD_CRC_ERROR) == 0) {
+                    const currentAddr = readReg(REG_FIFO_RX_CURRENT_ADDR)
+                    writeReg(REG_FIFO_ADDR_PTR, currentAddr)
+                    const len = readReg(REG_RX_NB_BYTES)
+                    const pkt = burstRead(REG_FIFO, len)
+                    _lastRssi = readReg(REG_PKT_RSSI_VALUE) - 157
+                    _lastSnrRaw = readReg(REG_PKT_SNR_VALUE)
+                    const msg = pkt.toString()
+                    if (_rxHandler != null) {
+                        control.runInBackground(function () { _rxHandler(msg) })
+                    }
+                }
+                writeReg(REG_IRQ_FLAGS, IRQ_CLEAR_ALL)
+            }
+        })
         setMode(MODE_RX_CONTINUOUS)
 
         _inited = true
